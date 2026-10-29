@@ -1,0 +1,112 @@
+name: Skull-box build
+
+# Workflow propre au fork Skull-box/AdvancedSlimePaper (branche v2, figée sur le main amont 03191391, MC 26.2).
+# Compile ASP (patchs Paper via paperweight) et publie sur Reposilite (https://maven.skullbox.fr) :
+#   - version figée  <mcVersion>-<sha7>   → releases
+#   - SNAPSHOT mobile <mcVersion>-SNAPSHOT → snapshots
+# groupId fr.skullbox.asp : api, core, loaders, *-loader, asp-plugin, asp-server (voir .github/skullbox/).
+# Pas de synchronisation automatique avec l'amont, pas de déploiement sur les serveurs.
+
+on:
+  push:
+    branches: [v2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: skullbox-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # indra-git et le manifeste du serveur lisent l'historique
+
+      - name: JDK 25 (Temurin) + cache Gradle
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+
+      # paperweight applique les patchs avec git : il lui faut une identité.
+      - name: Identité git
+        run: |
+          git config --global user.name "Skull-box CI"
+          git config --global user.email "ci@skullbox.fr"
+
+      - name: Versions
+        id: ver
+        run: |
+          mc=$(sed -n 's/^mcVersion=//p' gradle.properties)
+          echo "release=$mc-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "snapshot=$mc-SNAPSHOT" >> "$GITHUB_OUTPUT"
+
+      - name: Mesure mémoire (arrière-plan)
+        run: |
+          nproc; free -m
+          nohup bash -c 'max=0; while true; do u=$(free -m | awk "/^Mem:/{print \$3}"); [ "$u" -gt "$max" ] && max=$u && echo "$max" > /tmp/mem-peak; sleep 5; done' >/dev/null 2>&1 &
+
+      - name: Appliquer les patchs (applyAllPatches)
+        run: ./gradlew --console=plain applyAllPatches
+
+      - name: Build (paperclip, plugin, modules ASP)
+        run: |
+          ./gradlew --console=plain createMojmapPaperclipJar :plugin:shadowJar \
+            :api:build :core:build :loaders:build :loaders:api-loader:build :loaders:file-loader:build \
+            :loaders:mongo-loader:build :loaders:mysql-loader:build :loaders:redis-loader:build :plugin:build
+          ls -la aspaper-server/build/libs plugin/build/libs
+
+      - name: Rassembler les jars
+        id: jars
+        run: |
+          server=$(ls aspaper-server/build/libs/*paperclip*mojmap*.jar 2>/dev/null | head -1)
+          [ -n "$server" ] || server=$(ls aspaper-server/build/libs/*paperclip*.jar | head -1)
+          plugin=$(ls plugin/build/libs/asp-plugin-*.jar | grep -v -e sources -e javadoc | head -1)
+          mkdir -p out
+          cp "$server" out/asp-server.jar
+          cp "$plugin" out/asp-plugin.jar
+          echo "server=$PWD/out/asp-server.jar" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Jars"
+            echo '```'
+            (cd out && sha256sum *.jar && ls -la)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          (cd out && sha256sum *.jar)
+
+      - name: Publier la version figée (releases)
+        if: github.ref == 'refs/heads/v2'
+        run: bash .github/skullbox/publish.sh "${{ steps.ver.outputs.release }}"
+        env:
+          SKULLBOX_SERVER_JAR: ${{ steps.jars.outputs.server }}
+          MAVEN_USERNAME: ${{ secrets.MAVEN_WRITE_USER }}
+          MAVEN_TOKEN: ${{ secrets.MAVEN_WRITE_TOKEN }}
+
+      - name: Publier le SNAPSHOT mobile (snapshots)
+        if: github.ref == 'refs/heads/v2'
+        run: bash .github/skullbox/publish.sh "${{ steps.ver.outputs.snapshot }}"
+        env:
+          SKULLBOX_SERVER_JAR: ${{ steps.jars.outputs.server }}
+          MAVEN_USERNAME: ${{ secrets.MAVEN_WRITE_USER }}
+          MAVEN_TOKEN: ${{ secrets.MAVEN_WRITE_TOKEN }}
+
+      - name: Jars en artefact du run
+        uses: actions/upload-artifact@v4
+        with:
+          name: asp-${{ steps.ver.outputs.release }}
+          path: out/*.jar
+          retention-days: 30
+
+      - name: Pic mémoire
+        if: always()
+        run: |
+          free -m
+          echo "Pic de mémoire utilisée : $(cat /tmp/mem-peak 2>/dev/null || echo ?) Mo sur $(free -m | awk '/^Mem:/{print $2}') Mo" | tee -a "$GITHUB_STEP_SUMMARY"

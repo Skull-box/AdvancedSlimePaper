@@ -1,0 +1,97 @@
+// Publication Skull-box sur Reposilite (https://maven.skullbox.fr). Propre au fork Skull-box/AdvancedSlimePaper :
+// ce script d'init (passé par --init-script) remplace la publication amont sans toucher à leur code. Le profil
+// « publish » amont (dépôt infernalsuite + signature GPG) n'est pas activé : -Ppublish=true n'est jamais passé.
+//
+// Environnement :
+//   SKULLBOX_VERSION      version publiée (26.2-<sha7> → releases, 26.2-SNAPSHOT → snapshots)
+//   SKULLBOX_SERVER_JAR   chemin du paperclip déjà construit (createMojmapPaperclipJar), publié en asp-server
+//   MAVEN_USERNAME / MAVEN_TOKEN   jeton d'écriture Reposilite
+//
+// Publié sous fr.skullbox.asp :
+//   - api, core, loaders, api-loader, file-loader, mongo-loader, mysql-loader, redis-loader (composant java : jar,
+//     sources, javadoc, pom avec dépendances) — mêmes artifactIds que l'amont ;
+//   - asp-plugin (jar shadé du module plugin, pom sans dépendances) ;
+//   - asp-server (paperclip, pom sans dépendances).
+
+def skVersion = System.getenv('SKULLBOX_VERSION')
+def skGroup = 'fr.skullbox.asp'
+def skUrl = (skVersion ?: '').endsWith('-SNAPSHOT') ? 'https://maven.skullbox.fr/snapshots' : 'https://maven.skullbox.fr/releases'
+def skServerJar = System.getenv('SKULLBOX_SERVER_JAR')
+
+def skRepo = { p ->
+    p.publishing.repositories {
+        maven {
+            name = 'skullbox'
+            url = p.uri(skUrl)
+            credentials {
+                username = System.getenv('MAVEN_USERNAME')
+                password = System.getenv('MAVEN_TOKEN')
+            }
+        }
+    }
+}
+
+def skPom = { pom, n, d ->
+    pom.name = n
+    pom.description = d
+    pom.url = 'https://github.com/Skull-box/AdvancedSlimePaper'
+    pom.licenses {
+        license {
+            name = 'GNU General Public License, Version 3.0'
+            url = 'https://www.gnu.org/licenses/gpl-3.0.txt'
+        }
+    }
+    pom.scm {
+        url = 'https://github.com/Skull-box/AdvancedSlimePaper/tree/v2'
+    }
+}
+
+allprojects { p ->
+    p.pluginManager.withPlugin('asp.publishing-conventions') {
+        p.afterEvaluate {
+            if (skVersion == null) return
+            def cfg = p.extensions.getByName('publishConfiguration')
+            p.publishing.publications {
+                if (p.path == ':plugin') {
+                    skullbox(MavenPublication) {
+                        groupId = skGroup
+                        artifactId = 'asp-plugin'
+                        version = skVersion
+                        artifact(p.tasks.named('shadowJar'))
+                        skPom(pom, 'Advanced Slime Paper Plugin (Skull-box)', 'Jar shadé du plugin ASP, build Skull-box')
+                    }
+                } else {
+                    skullbox(MavenPublication) {
+                        groupId = skGroup
+                        artifactId = p.name
+                        version = skVersion
+                        from p.components.java
+                        versionMapping {
+                            usage('java-api') { fromResolutionOf('runtimeClasspath') }
+                            usage('java-runtime') { fromResolutionResult() }
+                        }
+                        skPom(pom, cfg.name.getOrElse(p.name), cfg.description.getOrElse(''))
+                    }
+                }
+            }
+            skRepo(p)
+        }
+    }
+}
+
+rootProject { p ->
+    p.afterEvaluate {
+        if (skVersion == null || skServerJar == null) return
+        p.pluginManager.apply('maven-publish')
+        p.publishing.publications {
+            skullboxServer(MavenPublication) {
+                groupId = skGroup
+                artifactId = 'asp-server'
+                version = skVersion
+                artifact(p.file(skServerJar)) { extension = 'jar' }
+                skPom(pom, 'Advanced Slime Paper server (Skull-box)', 'Paperclip ASP, build Skull-box')
+            }
+        }
+        skRepo(p)
+    }
+}
